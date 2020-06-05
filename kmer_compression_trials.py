@@ -40,7 +40,7 @@ def lexical_score(seq: str):
     return sum(map(ord, seq))
 
 
-def count_k_mers(seq: Tuple[int, str], ksize: int, verbose=False):
+def count_k_mers(seq: Tuple[int, str], ksize: int, verbose=True):
     """
     This function counts each k-mer in a provided string.
     It returns a sorted dictionary of k-mer keys and count values.
@@ -68,10 +68,8 @@ def count_k_mers(seq: Tuple[int, str], ksize: int, verbose=False):
             mers.update([mer])  # the  k-mer if it's lower lexically
         else:
             mers.update([rc])  # Else the reverse compliment
-        if (
-            verbose
-        ):  # Let the nervous observer know it's doing something. (for me, mostly)
-            print(f"Finished counting {index}, {len(mers)} {ksize}-mers found.")
+    if verbose:  # Let the nervous observer know it's doing something. (for me, mostly)
+        print(f"Finished counting {index}, {len(mers)} {ksize}-mers found.")
     return (
         index,
         dict(sorted(mers.items(), key=lambda x: x[0])),
@@ -140,6 +138,43 @@ def tokenize(list_of_seqs: list, token_size: int, verbose=True, dna_chars="acgt"
     return list_of_seqs  # only return the list of sequences, now tokenized!
 
 
+def col_compress(coo_in: coo_matrix) -> coo_matrix:
+    coo_in = coo_in.tocsc()
+    drop_cols = []
+    # First, drop columns with all equal counts
+    for i in range(coo_in.shape[1] - 1):
+        if coo_in.shape[0] != coo_in.getcol(i).nnz:
+            continue
+        if len(np.unique(coo_in.getcol(i)).tolist()) == 1:
+            drop_cols.append(i)
+    # Drop what matches
+    coo_in = coo_in[:, list(set(range(coo_in.shape[1])) - set(drop_cols))]
+
+    # Next, collapse columns that match
+    drop_cols = []
+    dont_drop = []
+    col_sums = coo_in.sum(axis=0).flatten().tolist()[0]  # Sum the columns, matching cols will have the same sum
+    count_dict = {}
+    for i in range(len(col_sums)):  # Make basically a reverse counter. Key is colsums, value is a list of indecies
+        count_dict.setdefault(col_sums[i], []).append(i)
+
+    # Filter out the ones
+    count_dict = {count: indices for count, indices in count_dict.items() if len(indices) > 1}
+
+    for possible_columns in count_dict.values():
+        for i in range(len(possible_columns)):
+            temp = possible_columns.copy()
+            temp.pop(i)
+            current_col = coo_in.getcol(possible_columns[i]).toarray()
+            for j in range(len(temp)):
+                if np.any(np.not_equal(coo_in.getcol(temp[j]).toarray(), current_col)):
+                    continue
+                elif temp[j] not in dont_drop:
+                    drop_cols.append(temp[j])
+                    dont_drop.append(possible_columns[i])
+    return coo_in[:, list(set(range(coo_in.shape[1] - 1)) - set(drop_cols))].tocoo()
+
+
 def dict_to_coo_lists(
     isolate: Tuple[int, dict], key: np.array
 ) -> Tuple[np.array, np.array, np.array]:
@@ -201,14 +236,14 @@ def main():
 
     start = datetime.now()
 
-    for token_size in [4, 10]:
-        with Pool(12) as p:
+    for token_size in [2, 10]:
+        with Pool(8) as p:
 
             seqs, y = load_data()
-            seqs = tokenize(seqs, token_size)
-            seqs = [(i, seq) for i, seq in enumerate(tokenize(seqs, token_size))]
+            # seqs = tokenize(seqs, token_size)
+            seqs = [(i, seq) for i, seq in enumerate(seqs[0:16])]
 
-            for ksize in range(2, 5):
+            for ksize in range(5, 10):
 
                 mappable_count_k_mers = partial(count_k_mers, ksize=ksize)
                 all_kmers = p.map(mappable_count_k_mers, seqs)
@@ -251,8 +286,13 @@ def main():
 
                 X = coo_matrix(
                     (data, (rows, cols)), shape=(len(seqs), len(key)), dtype="u1"
-                ).tocsr()
+                )
 
+                og_cols = X.shape[1]
+                # Compress it, columnwise
+                X = col_compress(X).tocsr()
+                after_cols = X.shape[1]
+                print(f"Dropped {og_cols - after_cols} columns, {og_cols}, {after_cols}")
                 # clean up before saving, pickle can be memory wasteful
                 for x in [rows, cols, data]:
                     del x
@@ -269,13 +309,13 @@ def main():
                 scores = cross_val_score(clf, X, y, cv=10)
 
                 print(  # print the scores and stuff, then write the scores.
-                    f"{token_size}, {ksize}, {len(key)}, {scores.mean()},",
+                    f"{token_size}, {ksize}, {og_cols}, {after_cols}, {scores.mean()},",
                     f"{scores.std()}, {scores}, {start}, {datetime.now()}",
                 )
                 f.write(
                     "".join(
                         [
-                            f"{token_size}, {ksize}, {len(key)}, {scores.mean()},",
+                            f"{token_size}, {ksize}, {og_cols}, {after_cols}, {scores.mean()},",
                             f" {scores.std()}, {scores}, {start}, {datetime.now()}",
                         ]
                     )
