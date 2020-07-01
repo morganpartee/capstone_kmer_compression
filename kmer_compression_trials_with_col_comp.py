@@ -2,44 +2,17 @@ from Bio import SeqIO
 from os import listdir
 import numpy as np
 from collections import Counter
-from scipy.sparse import coo_matrix
-from functools import partial
+from scipy.sparse import coo_matrix, csr_matrix
 from itertools import chain, product
 from typing import Tuple
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
-from multiprocessing import Pool
+import ray
 from datetime import datetime
+from sys import argv
 
 
-def reverse_compliment(seq: str):
-    """
-    This function returns the reverse compliment of the dna string. n's are not changed.
-    Strings are translated, then returned in reverse.
-    Examples:
-    >>> reverse_compliment('tacg')
-    'cgta'
-    >>> reverse_compliment('acgt')  # Yep, this is it's own reverse compliment
-    'acgt'
-    """
-    return seq.translate({97: 116, 99: 103, 103: 99, 116: 97})[::-1]
-
-
-def lexical_score(seq: str):
-    """
-    This function calculates a 'lexical score' for the given string.
-    This score is just the sum of the ord value for each character in the string.
-    This is used to determine which version (forward or reverse compliment)
-    of a k-mer to store.
-    Examples:
-    >>> lexical_score('aaaa')
-    388
-    >>> lexical_score('tttt')
-    464
-    """
-    return sum(map(ord, seq))
-
-
+@ray.remote
 def count_k_mers(seq: Tuple[int, str], ksize: int, verbose=True):
     """
     This function counts each k-mer in a provided string.
@@ -58,6 +31,33 @@ def count_k_mers(seq: Tuple[int, str], ksize: int, verbose=True):
     Counted 1
     Out[15]: (1, {'acgtc': 1, 'ccagd': 1, 'ggacg': 1, 'gtcca': 1, 'tccag': 1})
     """
+
+    def reverse_compliment(seq: str):
+        """
+        This function returns the reverse compliment of the dna string. n's are not changed.
+        Strings are translated, then returned in reverse.
+        Examples:
+        >>> reverse_compliment('tacg')
+        'cgta'
+        >>> reverse_compliment('acgt')  # Yep, this is it's own reverse compliment
+        'acgt'
+        """
+        return seq.translate({97: 116, 99: 103, 103: 99, 116: 97})[::-1]
+
+    def lexical_score(seq: str):
+        """
+        This function calculates a 'lexical score' for the given string.
+        This score is just the sum of the ord value for each character in the string.
+        This is used to determine which version (forward or reverse compliment)
+        of a k-mer to store.
+        Examples:
+        >>> lexical_score('aaaa')
+        388
+        >>> lexical_score('tttt')
+        464
+        """
+        return sum(map(ord, seq))
+
     index, seq = seq  # unpack the sequence, hold index for the return
 
     mers = Counter()
@@ -111,11 +111,22 @@ def tokenize(list_of_seqs: list, token_size: int, verbose=True, dna_chars="acgt"
     # are only made up of acgt. N is left out as it is uncommon.
     token_list = tuple("".join(toke) for toke in product(dna_chars, repeat=token_size))
 
+    @ray.remote
+    def ray_count(str_in, thing_to_count):
+        return str_in.count(thing_to_count)
+
     while size_redux < 0.99:
         before = len(seq)
         # For each token in the list, count it in the string. Give us the highest count key.
+        # Put the seq and tokes to ray for counting
+        ray.put(seq)
+        ray.put(token_list)
         token = max(
-            [(toke, seq.count(toke)) for toke in token_list], key=lambda x: x[1]
+            zip(
+                token_list,
+                ray.get([ray_count.remote(seq, toke) for toke in token_list]),
+            ),
+            key=lambda x: x[1],
         )[0]
 
         # Replace the token in the combined samples
@@ -138,43 +149,18 @@ def tokenize(list_of_seqs: list, token_size: int, verbose=True, dna_chars="acgt"
     return list_of_seqs  # only return the list of sequences, now tokenized!
 
 
-def col_compress(coo_in: coo_matrix) -> coo_matrix:
-    coo_in = coo_in.tocsc()
-    drop_cols = []
-    # First, drop columns with all equal counts
-    for i in range(coo_in.shape[1] - 1):
-        if coo_in.shape[0] != coo_in.getcol(i).nnz:
-            continue
-        if len(np.unique(coo_in.getcol(i)).tolist()) == 1:
-            drop_cols.append(i)
-    # Drop what matches
-    coo_in = coo_in[:, list(set(range(coo_in.shape[1])) - set(drop_cols))]
-
-    # Next, collapse columns that match
-    drop_cols = []
-    dont_drop = []
-    col_sums = coo_in.sum(axis=0).flatten().tolist()[0]  # Sum the columns, matching cols will have the same sum
-    count_dict = {}
-    for i in range(len(col_sums)):  # Make basically a reverse counter. Key is colsums, value is a list of indecies
-        count_dict.setdefault(col_sums[i], []).append(i)
-
-    # Filter out the ones
-    count_dict = {count: indices for count, indices in count_dict.items() if len(indices) > 1}
-
-    for possible_columns in count_dict.values():
-        for i in range(len(possible_columns)):
-            temp = possible_columns.copy()
-            temp.pop(i)
-            current_col = coo_in.getcol(possible_columns[i]).toarray()
-            for j in range(len(temp)):
-                if np.any(np.not_equal(coo_in.getcol(temp[j]).toarray(), current_col)):
-                    continue
-                elif temp[j] not in dont_drop:
-                    drop_cols.append(temp[j])
-                    dont_drop.append(possible_columns[i])
-    return coo_in[:, list(set(range(coo_in.shape[1] - 1)) - set(drop_cols))].tocoo()
+def col_compress(matrix_in: coo_matrix, indices: bool = False) -> csr_matrix:
+    matrix = np.sort(matrix_in.toarray(), axis=1)
+    indices_out = []
+    for col_index in range(matrix.shape[1] - 1):
+        if np.array_equal(matrix[:, col_index], matrix[:, col_index + 1]):
+            indices_out.append(col_index)
+    if indices:
+        return indices_out
+    return csr_matrix(matrix[:, list(set(range(matrix.shape[1])) - set(indices_out))], dtype=np.uint8)
 
 
+@ray.remote
 def dict_to_coo_lists(
     isolate: Tuple[int, dict], key: np.array
 ) -> Tuple[np.array, np.array, np.array]:
@@ -232,94 +218,98 @@ def load_data():
 
 
 def main():
-    f = open("log.txt", "w")
+    token_size = int(argv[1])
+    f = open(f"new_log-{token_size}.txt", "w")
 
-    start = datetime.now()
+    ray.init()
 
-    for token_size in [2, 10]:
-        with Pool(8) as p:
+    seqs, y = load_data()
+    seqs = tokenize(seqs, token_size)
+    seqs = [(i, seq) for i, seq in enumerate(seqs)]
 
-            seqs, y = load_data()
-            # seqs = tokenize(seqs, token_size)
-            seqs = [(i, seq) for i, seq in enumerate(seqs[0:16])]
+    ray.put(seqs)
 
-            for ksize in range(5, 10):
+    for ksize in range(8, 15):
+        start = datetime.now()
 
-                mappable_count_k_mers = partial(count_k_mers, ksize=ksize)
-                all_kmers = p.map(mappable_count_k_mers, seqs)
-                print(f"Counting complete for {token_size}, {ksize}")
+        all_kmers = ray.get([count_k_mers.remote(seq, ksize) for seq in seqs])
+        print(f"Counting complete for {token_size}, {ksize}")
 
-                # Create the key from the set of dictionary keys
-                key = chain.from_iterable([isolate[1].keys() for isolate in all_kmers])
-                # Sort it to be faster, get rid of the extras
-                key = np.array(sorted(set(key)), dtype=f"U{ksize}")
+        ray.put(all_kmers)
 
-                # Set the key to key for dict_to_coo_lists
-                mappable_dict_to_list = partial(dict_to_coo_lists, key=key)
+        # Create the key from the set of dictionary keys
+        key = chain.from_iterable([isolate[1].keys() for isolate in all_kmers])
+        # Sort it to be faster, get rid of the extras
+        key = np.array(sorted(set(key)), dtype=f"U{ksize}")
 
-                # Use the pool to convert our dictionaries
-                all_kmers = p.map(mappable_dict_to_list, all_kmers)
-                print(f"Conversion complete for {token_size}, {ksize}")
+        # Use the pool to convert our dictionaries
+        ray.put(key)
+        all_kmers = ray.get(
+            [dict_to_coo_lists.remote(kmer_dict, key) for kmer_dict in all_kmers]
+        )
+        print(f"Conversion complete for {token_size}, {ksize}")
 
-                # The idea here is that we use a COO matrix. Each of these three stores info for each point.
-                # At the end, we make one big matrix of shape len(seq), len(key), and feed it out points.
-                # example - rows[0] = 5, cols[0] = 3, data[0] = 9
-                # So, for the first element we stored, it is the point (5, 3) with value 9.
+        # The idea here is that we use a COO matrix. Each of these three stores info for each point.
+        # At the end, we make one big matrix of shape len(seq), len(key), and feed it out points.
+        # example - rows[0] = 5, cols[0] = 3, data[0] = 9
+        # So, for the first element we stored, it is the point (5, 3) with value 9.
 
-                # Sort the converted kmers by row index
-                all_kmers = sorted(all_kmers, key=lambda x: x[0][0])
+        # Sort the converted kmers by row index
+        all_kmers = sorted(all_kmers, key=lambda x: x[0][0])
 
-                # Initialize the arrays
-                rows = np.array([], dtype="u2")
-                cols = np.array([], dtype="u4")
-                data = np.array([], dtype="u1")
+        # Initialize the arrays
+        rows = np.array([], dtype="u2")
+        cols = np.array([], dtype="u4")
+        data = np.array([], dtype="u1")
 
-                # Updated out for each isolate
-                while all_kmers:
-                    row, row_cols, row_data = all_kmers.pop(0)
+        # Updated out for each isolate
+        while all_kmers:
+            row, row_cols, row_data = all_kmers.pop(0)
 
-                    rows = np.concatenate([rows, row])
-                    cols = np.concatenate([cols, row_cols])
-                    data = np.concatenate([data, row_data])
+            rows = np.concatenate([rows, row])
+            cols = np.concatenate([cols, row_cols])
+            data = np.concatenate([data, row_data])
 
-                del all_kmers
+        del all_kmers
 
-                X = coo_matrix(
-                    (data, (rows, cols)), shape=(len(seqs), len(key)), dtype="u1"
-                )
+        X = coo_matrix(
+            (data, (rows, cols)), shape=(len(seqs), len(key)), dtype="u1"
+        )
 
-                og_cols = X.shape[1]
-                # Compress it, columnwise
-                X = col_compress(X).tocsr()
-                after_cols = X.shape[1]
-                print(f"Dropped {og_cols - after_cols} columns, {og_cols}, {after_cols}")
-                # clean up before saving, pickle can be memory wasteful
-                for x in [rows, cols, data]:
-                    del x
+        print(X.dtype)
+        # remove this stuff now that we're done with it
+        for x in [rows, cols, data]:
+            del x
 
-                print(f"Fitting for {token_size}, {ksize}")
-                clf = RandomForestClassifier(
-                    n_jobs=32,
-                    random_state=42,
-                    n_estimators=2048,
-                    class_weight="balanced",
-                    oob_score=True,
-                )
-                # Do ten fold cv
-                scores = cross_val_score(clf, X, y, cv=10)
+        og_cols = X.shape[1]
+        # Compress it, columnwise
+        X = col_compress(X)
+        after_cols = X.shape[1]
+        print(f"Dropped {og_cols - after_cols} columns, {og_cols}, {after_cols}")
 
-                print(  # print the scores and stuff, then write the scores.
+        print(f"Fitting for {token_size}, {ksize}")
+        clf = RandomForestClassifier(
+            n_jobs=32,
+            random_state=42,
+            n_estimators=512,
+            class_weight="balanced",
+            oob_score=True,
+        )
+        # Do ten fold cv
+        scores = cross_val_score(clf, X.toarray(), y, cv=10)
+
+        print(  # print the scores and stuff, then write the scores.
+            f"{token_size}, {ksize}, {og_cols}, {after_cols}, {scores.mean()},",
+            f"{scores.std()}, {scores}, {start}, {datetime.now()}",
+        )
+        f.write(
+            "".join(
+                [
                     f"{token_size}, {ksize}, {og_cols}, {after_cols}, {scores.mean()},",
-                    f"{scores.std()}, {scores}, {start}, {datetime.now()}",
-                )
-                f.write(
-                    "".join(
-                        [
-                            f"{token_size}, {ksize}, {og_cols}, {after_cols}, {scores.mean()},",
-                            f" {scores.std()}, {scores}, {start}, {datetime.now()}",
-                        ]
-                    )
-                )
+                    f" {scores.std()}, {scores}, {start}, {datetime.now()}\n",
+                ]
+            )
+        )
 
     f.close()
 
