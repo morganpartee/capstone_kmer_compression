@@ -3,17 +3,19 @@ from os import listdir
 import numpy as np
 from collections import Counter
 from scipy.sparse import coo_matrix, csr_matrix
-from itertools import chain, product
+from itertools import chain
 from typing import Tuple
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
 import ray
 from datetime import datetime
 from sys import argv
+from random import sample
+from functools import reduce
 
 
 @ray.remote
-def count_k_mers(seq: Tuple[int, str], ksize: int, verbose=True):
+def count_k_mers(seq: str, ksize: int, verbose=True, reverse_compliment_only=True):
     """
     This function counts each k-mer in a provided string.
     It returns a sorted dictionary of k-mer keys and count values.
@@ -58,95 +60,88 @@ def count_k_mers(seq: Tuple[int, str], ksize: int, verbose=True):
         """
         return sum(map(ord, seq))
 
-    index, seq = seq  # unpack the sequence, hold index for the return
-
     mers = Counter()
     for i in range(len(seq) - ksize):
         mer = seq[i : i + ksize]  # Each k-mer is a sliding window piece of the sequence
-        rc = reverse_compliment(mer)
-        if lexical_score(mer) < lexical_score(rc):  # update the counter with:
-            mers.update([mer])  # the  k-mer if it's lower lexically
+        if reverse_compliment_only:
+            rc = reverse_compliment(mer)
+            if lexical_score(mer) < lexical_score(rc):  # update the counter with:
+                mers.update([mer])  # the  k-mer if it's lower lexically
+            else:
+                mers.update([rc])  # Else the reverse compliment
         else:
-            mers.update([rc])  # Else the reverse compliment
+            mers.update([mer])
+
     if verbose:  # Let the nervous observer know it's doing something. (for me, mostly)
-        print(f"Finished counting {index}, {len(mers)} {ksize}-mers found.")
-    return (
-        index,
-        dict(sorted(mers.items(), key=lambda x: x[0])),
-    )  # Sort the dictionary by key alphabetically, return
+        print(f"Finished counting, {len(mers)} {ksize}-mers found.")
+
+    return mers  # Sort the dictionary by key alphabetically, return
 
 
-def tokenize(list_of_seqs: list, token_size: int, verbose=True, dna_chars="acgt"):
-    """
-    This function is a naive compression algorithm. It replaces common sequences
-    with a token (starting at capital A), replacing them until it no longer saves
-    us 1% of the total length.
+def tokenize(
+    list_of_seqs: list,
+    token_size: int,
+    goal_redux: float = 0.4,
+    sample_size: float = 0.1,
+    verbose: bool = True,
+):
+    # Select a random sample from the input sequences
+    samples = sample(list_of_seqs, round(len(list_of_seqs) * sample_size))
+    initial_length = sum([len(sample) for sample in samples])
+    reduced_length = initial_length
 
-    This is slow! It must tokenize all of the data at once and each sample independently
-    to maintain the tokenization scheme across samples.
+    tokens_to_be_replaced = []
+    token_index = 65
 
-    Examples:
-    # Just for you rob:
-    In [21]: tokenize(["the quick brown dog the lazy fox"], 3, dna_chars='the')
-    Out[21]: ['A quick brown dog A lazy fox']
-
-    In [23]: tokenize(["aaacccgggttttcgatcgatcgatcgatcgatatcggctatatacgc"], 3, True)
-    Replaced tcg with A for a 0.25000% savings.
-    Replaced ata with B for a 0.11111% savings.
-    Replaced aaa with C for a 0.06250% savings.
-    Replaced acg with D for a 0.06667% savings.
-    Replaced ccc with E for a 0.07143% savings.
-    Replaced gct with F for a 0.07692% savings.
-    Replaced ggg with G for a 0.08333% savings.
-    Replaced ttt with H for a 0.09091% savings.
-    Replaced aaa with I for a 0.00000% savings.
-    Out[23]: ['CEGHAaAaAaAaABAFBtDc']
-    """
-    seq = "".join(
-        list_of_seqs
-    )  # Combine everything, so that we can count/tokenize this
-    size_redux = 0  # basically a 'true' for the while loop
-    token_index = 65  # start with capital A, try chr(65)
-    # Since this is DNA represented by acgt, we can assume the most common sequences
-    # are only made up of acgt. N is left out as it is uncommon.
-    token_list = tuple("".join(toke) for toke in product(dna_chars, repeat=token_size))
-
-    @ray.remote
-    def ray_count(str_in, thing_to_count):
-        return str_in.count(thing_to_count)
-
-    while size_redux < 0.99:
-        before = len(seq)
+    while (1 - reduced_length / initial_length) < goal_redux:
         # For each token in the list, count it in the string. Give us the highest count key.
-        # Put the seq and tokes to ray for counting
-        ray.put(seq)
-        ray.put(token_list)
-        token = max(
-            zip(
-                token_list,
-                ray.get([ray_count.remote(seq, toke) for toke in token_list]),
-            ),
-            key=lambda x: x[1],
-        )[0]
+
+        # Count the tokens here as though they were kmers
+        counts = ray.get(
+            [
+                count_k_mers.remote(
+                    seq, token_size, verbose=False, reverse_compliment_only=False
+                )
+                for seq in samples
+            ]
+        )
+
+        # Add all the counters together, and extract the most common k-mer
+        counts = reduce(lambda x, y: x + y, counts)
+        token = counts.most_common(1)[0][0]
+
+        # And store it
+        tokens_to_be_replaced.append(token)
 
         # Replace the token in the combined samples
-        seq = seq.replace(token, chr(token_index))
-
-        # And, replace the token in each contig
-        list_of_seqs = [x.replace(token, chr(token_index)) for x in list_of_seqs]
+        samples = [seq.replace(token, chr(token_index)) for seq in samples]
 
         # Calculate the percent reduced
-        size_redux = len(seq) / before
+        reduced_length = sum([len(sample) for sample in samples])
 
         if (
             verbose
         ):  # Let the nervous observer know it's doing something. (for me, mostly)
             print(
-                f"Replaced {token} with {chr(token_index)} for a {1-size_redux:.5f}% savings."
+                f"Replaced {token} with {chr(token_index)} for a {(1-reduced_length/initial_length)*100:.5f}% cumulative savings."
             )
 
         token_index += 1  # move on to the next token
-    return list_of_seqs  # only return the list of sequences, now tokenized!
+
+    tokens_to_be_replaced = [
+        (token, chr(index + 65)) for index, token in enumerate(tokens_to_be_replaced)
+    ]
+
+    @ray.remote
+    def replace_all(seq: str, tokens: list):
+        for token, char in tokens_to_be_replaced:
+            seq = seq.replace(token, char)
+        return seq
+
+    # only return the list of sequences, now tokenized!
+    return ray.get(
+        [replace_all.remote(seq, tokens_to_be_replaced) for seq in list_of_seqs]
+    )
 
 
 def col_compress(matrix_in: coo_matrix, indices: bool = False) -> csr_matrix:
@@ -157,12 +152,14 @@ def col_compress(matrix_in: coo_matrix, indices: bool = False) -> csr_matrix:
             indices_out.append(col_index)
     if indices:
         return indices_out
-    return csr_matrix(matrix[:, list(set(range(matrix.shape[1])) - set(indices_out))], dtype=np.uint8)
+    return csr_matrix(
+        matrix[:, list(set(range(matrix.shape[1])) - set(indices_out))], dtype=np.uint8
+    )
 
 
 @ray.remote
 def dict_to_coo_lists(
-    isolate: Tuple[int, dict], key: np.array
+    isolate: Counter, index: int, key: np.array
 ) -> Tuple[np.array, np.array, np.array]:
     """
     Turns a dictionary into the parts necessary to make a scipy COO sparse array.
@@ -171,21 +168,20 @@ def dict_to_coo_lists(
     The assumption here is that each kmer count dict will not have all of the kmers present
     in the data, hence the need for a key. This makes the counting a lot faster.
     """
-    i, isolate = isolate
     row_cols = []
     row_data = []
 
     # for each key, put it in the row/data lists
-    for index, kmer, in enumerate(key):  # Loop over the list of found kmers
+    for i, kmer, in enumerate(key):  # Loop over the list of found kmers
         value = isolate.pop(
             kmer, 0
         )  # kmer is 'aacgt' or something, remove it from the isolate if present, else get 0
         if value:  # if the value is nonzero, add it to the two lists
             row_data.append(value)  # row_data stores our data
-            row_cols.append(index)  # row_cols stores our column indices.
+            row_cols.append(i)  # row_cols stores our column indices.
 
     return (  # return the three indices required. The are: rows, columns, data. rows is just the row index repeated.
-        np.full(len(row_cols), i, dtype="u4"),  # array full of kmer index
+        np.full(len(row_cols), index, dtype="u4"),  # array full of kmer index
         np.array(row_cols, dtype="u2"),
         np.array(row_data, dtype="u1"),
     )
@@ -219,33 +215,36 @@ def load_data():
 
 def main():
     token_size = int(argv[1])
-    f = open(f"new_log-{token_size}.txt", "w")
+    compression_goal = float(argv[2])
 
-    ray.init()
+    f = open(f"new_log-{token_size}-{compression_goal}.txt", "w")
+
+    ray.init(include_webui=False, include_java=False)
 
     seqs, y = load_data()
-    seqs = tokenize(seqs, token_size)
-    seqs = [(i, seq) for i, seq in enumerate(seqs)]
 
-    ray.put(seqs)
+    if token_size > 1:
+        seqs = tokenize(seqs, token_size, goal_redux=compression_goal)
 
     for ksize in range(8, 15):
         start = datetime.now()
 
-        all_kmers = ray.get([count_k_mers.remote(seq, ksize) for seq in seqs])
+        all_kmers = ray.get(
+            [count_k_mers.remote(seq, ksize, verbose=False) for seq in seqs]
+        )
         print(f"Counting complete for {token_size}, {ksize}")
 
         ray.put(all_kmers)
 
         # Create the key from the set of dictionary keys
-        key = chain.from_iterable([isolate[1].keys() for isolate in all_kmers])
+        key = chain.from_iterable([isolate.keys() for isolate in all_kmers])
         # Sort it to be faster, get rid of the extras
         key = np.array(sorted(set(key)), dtype=f"U{ksize}")
 
         # Use the pool to convert our dictionaries
         ray.put(key)
         all_kmers = ray.get(
-            [dict_to_coo_lists.remote(kmer_dict, key) for kmer_dict in all_kmers]
+            [dict_to_coo_lists.remote(kmer_dict, index, key) for index, kmer_dict in enumerate(all_kmers)]
         )
         print(f"Conversion complete for {token_size}, {ksize}")
 
@@ -272,9 +271,7 @@ def main():
 
         del all_kmers
 
-        X = coo_matrix(
-            (data, (rows, cols)), shape=(len(seqs), len(key)), dtype="u1"
-        )
+        X = coo_matrix((data, (rows, cols)), shape=(len(seqs), len(key)), dtype="u1")
 
         print(X.dtype)
         # remove this stuff now that we're done with it
